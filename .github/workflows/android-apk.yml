@@ -15,6 +15,38 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # You upload the project as a .zip file: this step unzips the newest .zip in the
+      # repository and finds the Gradle project (settings.gradle) inside it.
+      # If there is no .zip, it uses settings.gradle files uploaded normally.
+      - name: Unzip project and find Gradle folder
+        id: proj
+        run: |
+          ZIP=""; BEST=-1
+          while IFS= read -r z; do
+            T=$(git log -1 --format=%ct -- "$z" 2>/dev/null); T=${T:-0}
+            if [ "$T" -ge "$BEST" ]; then BEST=$T; ZIP="$z"; fi
+          done < <(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' -not -path './_build/*')
+
+          if [ -n "$ZIP" ]; then
+            echo "Using zip: $ZIP"
+            rm -rf _build && mkdir -p _build
+            unzip -q -o "$ZIP" -d _build
+            FILE=$(find _build -name settings.gradle | head -n 1)
+          else
+            FILE=$(find . -name settings.gradle -not -path './.git/*' | head -n 1)
+          fi
+
+          if [ -z "$FILE" ]; then
+            echo "::error::No Gradle project found. Upload the project .zip (it must contain settings.gradle) to the repository root."
+            echo "Repository files:"; find . -maxdepth 3 -not -path './.git/*' | head -50
+            exit 1
+          fi
+          DIR=$(dirname "$FILE")
+          echo "Gradle project folder: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-java@v4
         with:
@@ -22,8 +54,8 @@ jobs:
           java-version: '17'
 
       # GitHub's ubuntu runner already has the Android SDK (ANDROID_HOME).
-      # android-actions/setup-android was failing in sdkmanager, so it is not needed.
       - name: Point Gradle to the preinstalled Android SDK
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
           ls "$ANDROID_HOME/platforms" || true
@@ -48,6 +80,7 @@ jobs:
           fi
 
       - name: Build debug + release APK
+        working-directory: ${{ steps.proj.outputs.dir }}
         env:
           KEYSTORE_PATH: ${{ github.workspace }}/release.keystore
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -56,6 +89,7 @@ jobs:
         run: gradle :app:assembleDebug :app:assembleRelease --no-daemon
 
       - name: Name the APK files
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
           VER=$(grep -oP "versionName '\K[^']+" app/build.gradle)
           mkdir -p dist
@@ -66,16 +100,16 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: mage-lori-release-apk
-          path: dist/*-release.apk
+          path: ${{ steps.proj.outputs.dir }}/dist/*-release.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: mage-lori-debug-apk
-          path: dist/*-debug.apk
+          path: ${{ steps.proj.outputs.dir }}/dist/*-debug.apk
 
       # Tag a version (e.g. v1.8) to publish the release APK on the GitHub Releases page.
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*-release.apk
+          files: ${{ steps.proj.outputs.dir }}/dist/*-release.apk
